@@ -1,0 +1,20 @@
+[Unit]
+Description=openhab-ssdp-relay (SSDP relay for openHAB's UPnP bindings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/openhab-ssdp-relay/ssdp_relay.py /opt/openhab-ssdp-relay/config.json
+Restart=always
+RestartSec=5
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

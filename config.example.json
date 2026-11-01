@@ -1,0 +1,10 @@
+{
+  "bind_ip": null,
+  "upstream": ["198.51.100.21"],
+  "upstream_notify_port": 1900,
+  "upstream_response_port": 1901,
+  "filters": ["RINCON", "Sonos"],
+  "search_interval": 300,
+  "mx": 3,
+  "local_net": "192.0.2."
+}
