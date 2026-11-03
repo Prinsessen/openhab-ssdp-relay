@@ -6,5 +6,6 @@
   "filters": ["RINCON", "Sonos"],
   "search_interval": 300,
   "mx": 3,
-  "local_net": "192.0.2."
+  "local_net": "192.0.2.",
+  "announce": []
 }

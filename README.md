@@ -12,7 +12,7 @@ It is not another mDNS/multicast reflector. Those forward multicast between VLAN
 
 ## What it does
 
-One UDP socket bound to port 1900 on the relay host, three jobs:
+One UDP socket bound to port 1900 on the relay host, four jobs (the fourth below the diagram):
 
 ```
  openHAB (other VLAN)                              relay host (devices' VLAN, wired)                        devices (e.g. Sonos)
@@ -32,6 +32,17 @@ One UDP socket bound to port 1900 on the relay host, three jobs:
 - Only datagrams containing one of `filters` (default `RINCON`, `Sonos`) are forwarded, so openHAB
   does not discover every UPnP device in the VLAN. Add a string to relay another device type.
 - Searches from other hosts (a phone, a TV) are ignored; only `upstream` hosts are served.
+
+**[4] Sonos players at another site.** A player behind a site-to-site VPN gets no SSDP at all: VPNs
+rarely carry multicast or broadcast, and a Sonos player does not answer a unicast M-SEARCH. Its
+description page (`http://<ip>:1400/xml/device_description.xml`) does answer across the VPN, and that
+is all jUPnP needs. List such players by IP in `announce`; every `search_interval` the relay fetches
+each one's page (3 s timeout - proof it is there, and its UDN) and sends openHAB three `NOTIFY ssdp:alive`
+(rootdevice, the UDN, ZonePlayer) pointing at it, with `max-age` three intervals (at least 1800 s).
+jUPnP fetches the page itself and the binding finds the player. A player that does not answer is not
+announced and expires in openHAB like one switched off; the log says so once, and again when it is
+back. The player must reach openHAB's HTTP port (8080) across the VPN too, for the binding's events
+and for audio sinks. The relay host only needs a route to the player; it need not be at that site.
 
 ## Requirements
 
@@ -74,7 +85,9 @@ sudo bash install.sh                    # /opt/openhab-ssdp-relay + systemd serv
 ## Is it working?
 
 1. `systemctl status openhab-ssdp-relay`; `journalctl -u openhab-ssdp-relay` shows
-   `listening on <ip>:1900 ...` and an hourly summary `last hour: {'search': n, 'response': n, 'notify': n, 'dropped': n}`.
+   `listening on <ip>:1900 ...` and an hourly summary `last hour: {'search': n, 'response': n, 'notify': n, 'dropped': n, 'announce': n}`.
+   With `announce` set: `announcing <ip> (<model>, <room>, uuid:RINCON_...)` once after a start, or
+   `<ip> does not answer on :1400` while the player or the route to it is down.
    `Environment=SONOS_RELAY_DEBUG=1` in the unit logs one line per datagram.
 2. In openHAB the devices appear in the inbox / the things go ONLINE within `search_interval`.
 3. If the things are ONLINE but their channels never update: the UPnP **event** path is broken, not
@@ -90,8 +103,8 @@ port 1900 receives both, which is easy to misread.
 python3 -m unittest discover -s tests
 ```
 
-The relay's logic (`Relay.on_packet`, `Relay.tick`) is pure and covered by 15 offline tests; the
-socket loop is not.
+The relay's logic (`Relay.on_packet`, `Relay.tick`, `Relay.announce`, `parse_description`) is pure and
+covered by 22 offline tests; the socket loop and the HTTP fetch are not.
 
 ## Limits, honestly
 
@@ -99,6 +112,9 @@ socket loop is not.
   another VLAN behind a FortiGate, the relay on a Debian VM. That a controller delivers a wired
   broadcast to its wireless stations was measured there, not guaranteed elsewhere.
 - Answers from devices outside `local_net` and datagrams not matching `filters` are dropped.
+- `announce` is for Sonos players (port 1400, ZonePlayer); another device type would need its own
+  description URL and device type. A player at another site is added by hand - nothing discovers it.
+  Proved with one Play:1 across a site-to-site VPN (2026-11-03).
 - No IPv6.
 
 ## Origin

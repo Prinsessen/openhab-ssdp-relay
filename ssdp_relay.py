@@ -2,7 +2,7 @@
 """openhab-ssdp-relay - SSDP relay for openHAB's UPnP bindings (Sonos and others) when the devices sit
 behind Wi-Fi gear or a VLAN boundary that drops multicast. See README.md.
 
-Runs on a wired host in the devices' VLAN. Three jobs, one socket bound to UDP 1900:
+Runs on a wired host in the devices' VLAN. Four jobs, one socket bound to UDP 1900:
 
   1. openHAB's multicast M-SEARCH (openHAB -> 239.255.255.250:1900, if your router forwards it here)
      is re-sent as a *broadcast* (255.255.255.255:1900) - the form of search that reaches devices
@@ -14,13 +14,19 @@ Runs on a wired host in the devices' VLAN. Three jobs, one socket bound to UDP 1
   3. Every `search_interval` seconds the relay searches by itself (ST upnp:rootdevice) and forwards
      the answers to openHAB's 1901 - so openHAB finds the devices even when its own multicast never
      reaches this VLAN, and a missed NOTIFY never lets a device expire from the registry.
+  4. Sonos players no search reaches at all (`announce`: their IPs - e.g. one at another site, behind a
+     site-to-site VPN that carries no multicast or broadcast) are announced by the relay itself every
+     `search_interval`: it fetches the player's description page (proof it is there, and its UDN) and
+     sends openHAB three NOTIFY ssdp:alive pointing at it. jUPnP fetches the page itself and the
+     binding finds the player. A player that does not answer is not announced, so it expires in
+     openHAB as a switched-off one would.
 
 Only datagrams matching `filters` (default: RINCON / Sonos) are forwarded, so openHAB does not
 discover every UPnP device in the VLAN; add a string to relay another device. All logic is in
 `Relay` (pure, unit-tested in tests/test_relay.py); `main()` is the socket loop. Standard library
 only; Python 3.9+; Linux (IP_PKTINFO).
 """
-import json, logging, os, select, socket, struct, sys, time
+import json, logging, os, re, select, socket, struct, sys, time, urllib.request
 
 LOG = logging.getLogger('openhab-ssdp-relay')
 SSDP_GROUP = '239.255.255.250'
@@ -36,7 +42,24 @@ DEFAULT_CONFIG = {
     'search_interval': 300,          # the relay's own broadcast search, seconds (0 = off)
     'mx': 3,                         # MX of the relay's own search; answers are taken for mx + 2 s
     'local_net': '',                 # prefix of the devices' addresses, e.g. '192.168.10.'; '' = any source accepted
+    'announce': [],                  # Sonos players no search reaches (another site): announced by the relay itself
 }
+DESCRIPTION_URL = 'http://%s:1400/xml/device_description.xml'
+ZONEPLAYER = 'urn:schemas-upnp-org:device:ZonePlayer:1'
+
+
+def _tag(xml, name):
+    m = re.search(rb'<' + name + rb'>([^<]+)</' + name + rb'>', xml)
+    return m.group(1).decode('utf-8', 'replace').strip() if m else None
+
+
+def parse_description(xml):
+    """A player's device_description.xml -> {'udn', 'model', 'room'}, or None if it is not a Sonos player.
+    The first UDN is the root device's; the embedded MediaServer/MediaRenderer ones end in _MS/_MR."""
+    udn = _tag(xml or b'', b'UDN')
+    if not udn or 'RINCON_' not in udn:
+        return None
+    return {'udn': udn, 'model': _tag(xml, b'modelName'), 'room': _tag(xml, b'roomName')}
 
 
 def classify(data):
@@ -60,7 +83,9 @@ class Relay:
         self.filters = [f.encode() for f in self.cfg['filters']]
         self.pending = {}            # (ip, port) -> deadline: who is waiting for search answers
         self.next_search = 0.0
-        self.counts = {'search': 0, 'response': 0, 'notify': 0, 'dropped': 0}
+        self.counts = {'search': 0, 'response': 0, 'notify': 0, 'dropped': 0, 'announce': 0}
+        self.next_announce = 0.0
+        self.announced = {}          # ip -> the last description seen (None = did not answer), for the log
 
     # --- helpers -------------------------------------------------------------------------------
     def matches(self, data):
@@ -113,6 +138,35 @@ class Relay:
             self.pending[(up, self.cfg['upstream_response_port'])] = now + self.cfg['mx'] + 2
         return [(self.own_search(), (BROADCAST, SSDP_PORT))]
 
+    # --- job 4: players no search reaches ------------------------------------------------------
+    def announce_due(self, now):
+        """The players to fetch and announce now: all of them every search_interval (300 s if 0)."""
+        if not self.cfg['announce'] or now < self.next_announce:
+            return []
+        self.next_announce = now + (self.cfg['search_interval'] or 300)
+        return list(self.cfg['announce'])
+
+    def announce(self, ip, desc):
+        """Three NOTIFY ssdp:alive for the player at `ip` to every upstream; nothing if it did not answer."""
+        if not desc:
+            return []
+        age = max(1800, 3 * (self.cfg['search_interval'] or 300))
+        out = []
+        for nt, usn in (('upnp:rootdevice', desc['udn'] + '::upnp:rootdevice'), (desc['udn'], desc['udn']),
+                        (ZONEPLAYER, desc['udn'] + '::' + ZONEPLAYER)):
+            msg = ('NOTIFY * HTTP/1.1\r\nHOST: %s:%d\r\nCACHE-CONTROL: max-age=%d\r\nLOCATION: %s\r\nNT: %s\r\n'
+                   'NTS: ssdp:alive\r\nSERVER: Linux UPnP/1.0 Sonos/1.0 (openhab-ssdp-relay announce)\r\nUSN: %s\r\n\r\n'
+                   % (SSDP_GROUP, SSDP_PORT, age, DESCRIPTION_URL % ip, nt, usn)).encode()
+            out += [(msg, (up, self.cfg['upstream_notify_port'])) for up in self.upstream]
+        self.counts['announce'] += 1
+        return out
+
+    def announce_changed(self, ip, desc):
+        """True when a player started or stopped answering since the last fetch (the log says so once)."""
+        was = self.announced.get(ip, 'never')
+        self.announced[ip] = desc
+        return was == 'never' or (was is None) != (desc is None)
+
     @staticmethod
     def _mx_of(data):
         for line in data.split(b'\r\n'):
@@ -152,6 +206,14 @@ def recv(sock):
     return data, addr, dst
 
 
+def fetch_description(ip, timeout=3):
+    try:
+        with urllib.request.urlopen(DESCRIPTION_URL % ip, timeout=timeout) as resp:
+            return parse_description(resp.read(65536))
+    except OSError:
+        return None
+
+
 def main(argv):
     cfg_path = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
     cfg = dict(DEFAULT_CONFIG)
@@ -166,15 +228,27 @@ def main(argv):
     cfg['bind_ip'] = cfg.get('bind_ip') or guess_ip()
     relay = Relay(cfg)
     sock = open_socket(cfg['bind_ip'])
-    LOG.info('listening on %s:%d, upstream %s (notify -> :%d, answers -> :%d), filters %s, own search every %s s',
+    LOG.info('listening on %s:%d, upstream %s (notify -> :%d, answers -> :%d), filters %s, own search every %s s, announcing %s',
              cfg['bind_ip'], SSDP_PORT, relay.upstream, cfg['upstream_notify_port'],
-             cfg['upstream_response_port'], cfg['filters'], cfg['search_interval'])
+             cfg['upstream_response_port'], cfg['filters'], cfg['search_interval'], cfg['announce'] or 'none')
     last_summary = time.time()
     while True:
         now = time.time()
         for payload, target in relay.tick(now):
             sock.sendto(payload, target)
             LOG.debug('own search -> %s', target)
+        for ip in relay.announce_due(now):          # a few seconds at most, once per search_interval
+            desc = fetch_description(ip)
+            if relay.announce_changed(ip, desc):
+                if desc:
+                    LOG.info('announcing %s (%s, %s, %s) to %s', ip, desc['model'], desc['room'], desc['udn'], relay.upstream)
+                else:
+                    LOG.warning('%s does not answer on :1400 - not announced (it expires in openHAB)', ip)
+            for payload, target in relay.announce(ip, desc):
+                try:
+                    sock.sendto(payload, target)
+                except OSError as e:
+                    LOG.warning('send to %s failed: %s', target, e)
         rl, _, _ = select.select([sock], [], [], 1.0)
         if rl:
             data, src, dst = recv(sock)

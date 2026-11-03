@@ -4,7 +4,7 @@ Run: python3 -m unittest discover -s tests
 import os, sys, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from ssdp_relay import Relay, classify, BROADCAST  # noqa: E402
+from ssdp_relay import Relay, classify, parse_description, BROADCAST  # noqa: E402
 
 VM = '192.0.2.22'; OH = '198.51.100.21'; PLAYER = '192.0.2.174'; GROUP = '239.255.255.250'
 SEARCH = b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n'
@@ -109,8 +109,70 @@ class Counters(unittest.TestCase):
         r = relay()
         r.on_packet(SEARCH, (OH, 1901), GROUP, 100.0); r.on_packet(ANSWER, (PLAYER, 1900), VM, 101.0)
         r.on_packet(ALIVE, (PLAYER, 1900), BROADCAST, 102.0); r.on_packet(TV_ALIVE, ('192.0.2.50', 1900), BROADCAST, 103.0)
-        self.assertEqual(r.counts, {'search': 1, 'response': 1, 'notify': 1, 'dropped': 1})
+        self.assertEqual(r.counts, {'search': 1, 'response': 1, 'notify': 1, 'dropped': 1, 'announce': 0})
 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# --- job 4: announcing players no search reaches ---------------------------------------------------
+# A Sonos player at another site, behind a site-to-site VPN: no multicast or broadcast crosses it, and
+# the player does not answer a unicast M-SEARCH either. Its description page does answer over the VPN,
+# and one NOTIFY alive pointing at it, sent to openHAB's 1900, puts it in the inbox within a second
+# (measured on the original installation). So the relay announces such players itself.
+REMOTE = '203.0.113.100'
+DESCRIPTION = (b'<?xml version="1.0" encoding="utf-8" ?><root xmlns="urn:schemas-upnp-org:device-1-0"><device>'
+               b'<deviceType>urn:schemas-upnp-org:device:ZonePlayer:1</deviceType><roomName>Office</roomName>'
+               b'<modelNumber>S12</modelNumber><modelName>Sonos Play:1</modelName><UDN>uuid:RINCON_000E58AA0BB001400</UDN>'
+               b'<deviceList><device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>'
+               b'<UDN>uuid:RINCON_000E58AA0BB001400_MS</UDN></device><device>'
+               b'<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType><UDN>uuid:RINCON_000E58AA0BB001400_MR</UDN>'
+               b'</device></deviceList></device></root>')
+
+
+class Job4_Announce(unittest.TestCase):
+    def test_the_description_gives_the_root_players_udn_not_an_embedded_ones(self):
+        d = parse_description(DESCRIPTION)
+        self.assertEqual(d, {'udn': 'uuid:RINCON_000E58AA0BB001400', 'model': 'Sonos Play:1', 'room': 'Office'})
+        self.assertIsNone(parse_description(b'<html>not a player</html>'))
+        self.assertIsNone(parse_description(b''))
+
+    def test_nothing_to_announce_without_the_setting(self):
+        self.assertEqual(relay().announce_due(100.0), [])
+
+    def test_due_at_start_then_every_interval(self):
+        r = relay(announce=[REMOTE])
+        self.assertEqual(r.announce_due(100.0), [REMOTE])
+        self.assertEqual(r.announce_due(101.0), [])
+        self.assertEqual(r.announce_due(399.0), [])
+        self.assertEqual(r.announce_due(400.0), [REMOTE])
+
+    def test_three_notify_alive_to_every_upstream_pointing_at_the_players_page(self):
+        r = relay(announce=[REMOTE], upstream=[OH, '198.51.100.22'])
+        out = r.announce(REMOTE, parse_description(DESCRIPTION))
+        self.assertEqual(sorted({t for _, t in out}), [(OH, 1900), ('198.51.100.22', 1900)])
+        self.assertEqual(len(out), 6)
+        for payload, _ in out:
+            self.assertEqual(classify(payload), 'notify')
+            self.assertIn(b'LOCATION: http://203.0.113.100:1400/xml/device_description.xml\r\n', payload)
+            self.assertIn(b'NTS: ssdp:alive\r\n', payload)
+            self.assertIn(b'CACHE-CONTROL: max-age=1800\r\n', payload)
+            self.assertTrue(payload.endswith(b'\r\n\r\n'))
+        usns = sorted(l for p, t in out if t == (OH, 1900) for l in p.split(b'\r\n') if l.startswith(b'USN:'))
+        self.assertEqual(usns, [b'USN: uuid:RINCON_000E58AA0BB001400', b'USN: uuid:RINCON_000E58AA0BB001400::upnp:rootdevice',
+                                b'USN: uuid:RINCON_000E58AA0BB001400::urn:schemas-upnp-org:device:ZonePlayer:1'])
+
+    def test_a_player_that_did_not_answer_is_not_announced_so_it_expires_in_openhab(self):
+        r = relay(announce=[REMOTE])
+        self.assertEqual(r.announce(REMOTE, None), [])
+        self.assertEqual(r.counts['announce'], 0)
+
+    def test_the_log_hears_of_a_change_only(self):
+        r = relay(announce=[REMOTE])
+        d = parse_description(DESCRIPTION)
+        self.assertEqual([r.announce_changed(REMOTE, x) for x in (d, d, None, None, d)], [True, False, True, False, True])
+
+    def test_max_age_covers_three_intervals_at_least_1800_s(self):
+        r = relay(announce=[REMOTE], search_interval=900)
+        self.assertIn(b'max-age=2700', r.announce(REMOTE, parse_description(DESCRIPTION))[0][0])
